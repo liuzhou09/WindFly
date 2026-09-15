@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
+*.pth
+*.pt
+*.ckpt
+runs/
+RA-Net/outputs/training/
+AW-Net/src/build/
