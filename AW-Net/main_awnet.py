@@ -5,20 +5,17 @@ Notation follows the manuscript where possible:
     x_dot, x_dot_ref         velocity and reference velocity [m/s]
     x_ddot_d                desired acceleration before compensation [m/s^2]
     d_hat_over_m            estimated disturbance per unit mass [m/s^2]
-    F_min/max_parallel_over_m  derived signed directional thrust bounds [m/s^2]
+    a_T_parallel_min/max    derived signed thrust acceleration projections [m/s^2]
     x_ddot_min/max_parallel target-direction acceleration bounds [m/s^2]
     x_ddot_lim_parallel     selected acceleration boundary [m/s^2]
     a_T_max                 maximum thrust acceleration magnitude [m/s^2]
     pi_theta, h_k           AW-Net policy and recurrent state
     N, r_k                  rollout length and obstacle displacement samples
-    loss_bounds             dual-sided envelope penalty, Eq. (18)
-    loss_f                  active-boundary tracking, Eq. (19)
-    loss_w                  crosswind alignment objective
-    loss_mag                additional nominal magnitude penalty
+    loss_bounds             dual-sided envelope penalty, final-paper Eq. (18)
+    loss_f                  active-boundary tracking, final-paper Eq. (19)
+    loss_w                  aerodynamic efficiency objective, final-paper Eq. (20)
+    loss_mag                additional nominal magnitude penalty from main_cuda.py
 
-The directional capability envelope accounts for gravity, disturbance, and
-transverse compensation. F_min/max_parallel_over_m are derived quantities,
-not additional force parameters. The simulator supplies d_hat / m.
 """
 
 import argparse
@@ -57,7 +54,8 @@ def parse_args(argv=None):
                         help="Final wind curriculum level [m/s].")
     parser.add_argument("--wind-curriculum-iters", type=int, default=5000)
     parser.add_argument("--a-T-max", "--max_thrust", dest="a_T_max", type=float,
-                        default=20.0, help="Maximum thrust acceleration [m/s^2].")
+                        default=20.0,
+                        help="Given thrust magnitude limit per unit mass, F_max / m [m/s^2].")
     parser.add_argument("--beta", "--barrier_beta", type=float, default=10.0,
                         help="Softplus sharpness for normalized violations.")
 
@@ -78,10 +76,10 @@ def parse_args(argv=None):
                             type=float, default=default, help=description + " weight.")
     parser.add_argument("--lambda-bounds", "--lambda-env", "--coef_envelope_barrier",
                         dest="lambda_bounds", type=float, default=0.05,
-                        help="Directional envelope weight; Eq. (18).")
+                        help="Directional envelope weight; final-paper Eq. (18).")
     parser.add_argument("--lambda-f", "--lambda-boundary", "--coef_amax",
                         dest="lambda_f", type=float, default=0.7,
-                        help="Active-boundary tracking weight; Eq. (19).")
+                        help="Active-boundary tracking weight; final-paper Eq. (19).")
 
     parser.add_argument("--speed-mtp", "--speed_mtp", type=float, default=1.0)
     parser.add_argument("--fov-x-half-tan", "--fov_x_half_tan", type=float, default=0.53)
@@ -112,12 +110,15 @@ def parse_args(argv=None):
 
 
 def acceleration_bounds(n_k, g, d_hat_over_m, a_T_max):
-    """Return dynamic scalar acceleration bounds along n_k.
+    """Return dynamic scalar bounds along n_k using the source capability model.
 
     All quantities are mass normalized. Gravity and disturbance are split into
     target-direction and transverse components. The signed directional thrust
     budget is derived after transverse compensation, not configured separately.
-    Returned bounds have shape [batch, 1].
+    a_T_max corresponds to a given scalar thrust magnitude limit F_max / m.
+    The idealized actuator permits zero thrust; no positive minimum magnitude
+    is imposed. A negative directional endpoint means reverse acceleration,
+    not a negative thrust magnitude.
     """
     import torch
     from torch.nn import functional as F
@@ -126,13 +127,14 @@ def acceleration_bounds(n_k, g, d_hat_over_m, a_T_max):
     a_external_parallel = (a_external * n_k).sum(dim=-1, keepdim=True)
     a_external_perp = a_external - a_external_parallel * n_k
     a_external_perp_norm = a_external_perp.norm(p=2, dim=-1, keepdim=True)
-    # Derived signed projection endpoints, not collective thrust magnitudes.
-    F_max_parallel_over_m = torch.sqrt(
+
+    a_T_parallel_max = torch.sqrt(
         F.relu(a_T_max**2 - a_external_perp_norm**2) + 1e-6)
-    F_min_parallel_over_m = -F_max_parallel_over_m
-    x_ddot_min_parallel = (a_external_parallel + F_min_parallel_over_m).clamp(
+    a_T_parallel_min = -a_T_parallel_max
+    # Preserve the source numerical clipping; +/-1.5*a_T_max are not force limits.
+    x_ddot_min_parallel = (a_external_parallel + a_T_parallel_min).clamp(
         -1.5 * a_T_max, 1.5 * a_T_max)
-    x_ddot_max_parallel = (a_external_parallel + F_max_parallel_over_m).clamp(
+    x_ddot_max_parallel = (a_external_parallel + a_T_parallel_max).clamp(
         -1.5 * a_T_max, 1.5 * a_T_max)
     return x_ddot_min_parallel, x_ddot_max_parallel
 
@@ -145,7 +147,7 @@ def boundary_losses(x_ddot_d, n_k, g, x_ddot_min_parallel,
     from torch.nn import functional as F
 
     x_ddot_d_parallel = (x_ddot_d * n_k).sum(dim=-1, keepdim=True)
-    # Eq. (19): active-boundary tracking with a Smooth-L1 objective.
+    # Eq. (19): active-boundary tracking, with the source Smooth-L1 objective.
     loss_f = F.smooth_l1_loss(
         x_ddot_d_parallel / a_T_max, x_ddot_lim_parallel.detach() / a_T_max)
     # Eq. (18): the two margins are scalars along the target direction.
@@ -173,11 +175,7 @@ def saturated_command(x_ddot_d, g, d_hat_over_m, a_T_max):
 
 
 def wind_efficiency_loss(x_dot, x_dot_ref, wind_velocity, clearance_ahead):
-    """Return the crosswind alignment objective.
-
-    Velocities have shape [time, batch, 3]; clearance_ahead has shape
-    [time, look-ahead sample, batch]. The objective aligns transverse velocity
-    with transverse simulated wind and weights it by exp(-clearance).
+    """Return the source crosswind implementation of the Eq. (20) objective.
     """
     import torch
 
@@ -205,7 +203,7 @@ def rollout_objective(args, env, pi_theta, iteration):
     batch_size = args.batch_size
     history = defaultdict(list)
     h_k = None
-    # Two initial commands account for the controller delay.
+    # Preserve the source command pipeline: two initial commands before outputs.
     command_history = [env.act, env.act]
     r_target = env.p_target - env.p
 
@@ -242,7 +240,7 @@ def rollout_objective(args, env, pi_theta, iteration):
         x_dot = env.v
 
         if k % 5 == 0:
-            # The simulator supplies the estimated disturbance acceleration.
+            # Simulator-supplied acceleration estimate: paper d_hat / m.
             d_hat_over_m = env.get_wind_disturbance(noise_std=0.05)
         d_hat_over_m_local = (d_hat_over_m[:, None] @ R_yaw).squeeze(1)
         d_hat_over_m_input = (d_hat_over_m_local / args.a_T_max).clamp(-2.0, 2.0)
@@ -284,7 +282,7 @@ def rollout_objective(args, env, pi_theta, iteration):
     x_dot = trajectory["x_dot"]
     x_dot_ref = trajectory["x_dot_ref"]
     commands = torch.stack(command_history)
-    # Compare a 30-step averaged velocity against the aligned reference.
+    # Keep the original 30-step velocity averaging and reference alignment.
     x_dot_cumulative = x_dot.cumsum(dim=0)
     x_dot_average = (x_dot_cumulative[30:] - x_dot_cumulative[:-30]) / 30
     e_vel_norm = (x_dot_average - x_dot_ref[1:-29]).norm(p=2, dim=-1)
@@ -293,7 +291,6 @@ def rollout_objective(args, env, pi_theta, iteration):
     loss_acceleration = commands.square().sum(dim=-1).mean()
     loss_jerk = (commands.diff(dim=0) * 15).square().sum(dim=-1).mean()
 
-    # Select the active acceleration boundary from the velocity error.
     reference_speed = x_dot_ref.norm(p=2, dim=-1)
     n_ref = x_dot_ref / reference_speed[..., None].clamp_min(1e-6)
     forward_speed = (x_dot * n_ref).sum(dim=-1)
@@ -313,7 +310,7 @@ def rollout_objective(args, env, pi_theta, iteration):
     loss_clearance = (closing_speed * (1 - clearance_ahead).relu().square()).mean()
     loss_collision = (F.softplus(-32 * clearance_ahead) * closing_speed).mean()
 
-    # Crosswind alignment weighted by forward clearance.
+    # Eq. (20): retain the original crosswind alignment and spatial weighting.
     loss_w = wind_efficiency_loss(
         x_dot, x_dot_ref, trajectory["wind_velocity"], clearance_ahead)
 
