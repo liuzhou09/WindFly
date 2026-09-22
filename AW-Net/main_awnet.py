@@ -4,7 +4,7 @@ Notation follows the manuscript where possible:
     I_k                     onboard depth image
     x_dot, x_dot_ref         velocity and reference velocity [m/s]
     x_ddot_d                desired acceleration before compensation [m/s^2]
-    d_hat_over_m            estimated disturbance per unit mass [m/s^2]
+    d_hat            disturbance estimate 
     a_T_parallel_min/max    derived signed thrust acceleration projections [m/s^2]
     x_ddot_min/max_parallel target-direction acceleration bounds [m/s^2]
     x_ddot_lim_parallel     selected acceleration boundary [m/s^2]
@@ -16,6 +16,8 @@ Notation follows the manuscript where possible:
     loss_w                  aerodynamic efficiency objective, final-paper Eq. (20)
     loss_mag                additional nominal magnitude penalty from main_cuda.py
 
+The directional capability envelope uses the simulator or RA-Net disturbance
+estimate d_hat.
 """
 
 import argparse
@@ -59,7 +61,7 @@ def parse_args(argv=None):
     parser.add_argument("--beta", "--barrier_beta", type=float, default=10.0,
                         help="Softplus sharpness for normalized violations.")
 
-
+    
     weights = [
         ("velocity", "coef_v", 1.0, "Velocity tracking"),
         ("velocity-estimation", "coef_v_pred", 2.0, "Velocity estimation"),
@@ -109,25 +111,22 @@ def parse_args(argv=None):
     return args
 
 
-def acceleration_bounds(n_k, g, d_hat_over_m, a_T_max):
+def acceleration_bounds(n_k, g, d_hat, a_T_max):
     """Return dynamic scalar bounds along n_k using the source capability model.
 
     All quantities are mass normalized. Gravity and disturbance are split into
     target-direction and transverse components. The signed directional thrust
     budget is derived after transverse compensation, not configured separately.
     a_T_max corresponds to a given scalar thrust magnitude limit F_max / m.
-    The idealized actuator permits zero thrust; no positive minimum magnitude
-    is imposed. A negative directional endpoint means reverse acceleration,
-    not a negative thrust magnitude.
     """
     import torch
     from torch.nn import functional as F
 
-    a_external = g + d_hat_over_m
+    a_external = g + d_hat
     a_external_parallel = (a_external * n_k).sum(dim=-1, keepdim=True)
     a_external_perp = a_external - a_external_parallel * n_k
     a_external_perp_norm = a_external_perp.norm(p=2, dim=-1, keepdim=True)
-
+    # Derived signed projection endpoints, not collective thrust magnitudes.
     a_T_parallel_max = torch.sqrt(
         F.relu(a_T_max**2 - a_external_perp_norm**2) + 1e-6)
     a_T_parallel_min = -a_T_parallel_max
@@ -164,11 +163,11 @@ def boundary_losses(x_ddot_d, n_k, g, x_ddot_min_parallel,
     return loss_f, loss_bounds, loss_mag
 
 
-def saturated_command(x_ddot_d, g, d_hat_over_m, a_T_max):
+def saturated_command(x_ddot_d, g, d_hat, a_T_max):
     """Compensate disturbance, limit thrust, and use Env's gravity convention."""
     import torch
 
-    a_T_requested = x_ddot_d - g - d_hat_over_m
+    a_T_requested = x_ddot_d - g - d_hat
     a_T_norm = a_T_requested.norm(p=2, dim=-1, keepdim=True) + 1e-6
     scale = torch.clamp_max(a_T_norm, a_T_max) / a_T_norm
     return a_T_requested * scale + g
@@ -240,9 +239,9 @@ def rollout_objective(args, env, pi_theta, iteration):
         x_dot = env.v
 
         if k % 5 == 0:
-            # Simulator-supplied acceleration estimate: paper d_hat / m.
-            d_hat_over_m = env.get_wind_disturbance(noise_std=0.05)
-        d_hat_over_m_local = (d_hat_over_m[:, None] @ R_yaw).squeeze(1)
+            # Disturbance estimate from simulation or RA-Net.
+            d_hat = env.get_wind_disturbance(noise_std=0.05)
+        d_hat_over_m_local = (d_hat[:, None] @ R_yaw).squeeze(1)
         d_hat_over_m_input = (d_hat_over_m_local / args.a_T_max).clamp(-2.0, 2.0)
         x_dot_local = (x_dot[:, None] @ R_yaw).squeeze(1)
         obs_k = [
@@ -253,7 +252,7 @@ def rollout_objective(args, env, pi_theta, iteration):
             obs_k.insert(0, x_dot_local)
 
         x_ddot_min_parallel, x_ddot_max_parallel = acceleration_bounds(
-            n_k, g, d_hat_over_m, args.a_T_max)
+            n_k, g, d_hat, args.a_T_max)
         e_vel_parallel = x_dot_ref.norm(p=2, dim=-1, keepdim=True) - (
             x_dot * n_k).sum(dim=-1, keepdim=True)
         x_ddot_lim_parallel = torch.where(
@@ -267,7 +266,7 @@ def rollout_objective(args, env, pi_theta, iteration):
             R_yaw @ policy_output.reshape(batch_size, 3, -1)).unbind(-1)
         x_ddot_d = (x_ddot_head - x_dot_hat - g) * env.thr_est_error[:, None] + g
         command_history.append(saturated_command(
-            x_ddot_d, g, d_hat_over_m, args.a_T_max))
+            x_ddot_d, g, d_hat, args.a_T_max))
 
         for name, value in (
             ("x_dot", x_dot), ("x_dot_ref", x_dot_ref), ("x_dot_hat", x_dot_hat),
@@ -291,6 +290,7 @@ def rollout_objective(args, env, pi_theta, iteration):
     loss_acceleration = commands.square().sum(dim=-1).mean()
     loss_jerk = (commands.diff(dim=0) * 15).square().sum(dim=-1).mean()
 
+    # Reproduce the source's loss-time direction and active-boundary selection.
     reference_speed = x_dot_ref.norm(p=2, dim=-1)
     n_ref = x_dot_ref / reference_speed[..., None].clamp_min(1e-6)
     forward_speed = (x_dot * n_ref).sum(dim=-1)
